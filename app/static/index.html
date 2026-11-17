@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>再生塑料配方试配筛选</title>
+<style>
+  :root { --ink:#1f2933; --muted:#6b7280; --line:#d8dee6; --ok:#0f7b3d; --bad:#b42318; --warn:#9a6700; --bg:#f6f8fa; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: "PingFang SC","Microsoft YaHei",system-ui,sans-serif; color:var(--ink); background:var(--bg); }
+  header { background:#0b3d2e; color:#fff; padding:14px 22px; }
+  header h1 { margin:0; font-size:19px; }
+  header p { margin:4px 0 0; font-size:12.5px; opacity:.85; }
+  main { max-width: 980px; margin: 18px auto 60px; padding: 0 16px; }
+  section { background:#fff; border:1px solid var(--line); border-radius:10px; padding:16px 18px; margin-bottom:16px; }
+  h2 { font-size:15px; margin:0 0 12px; }
+  table { border-collapse: collapse; width:100%; }
+  th, td { padding:7px 8px; text-align:center; font-size:13.5px; }
+  th { color:var(--muted); font-weight:600; border-bottom:2px solid var(--line); }
+  td { border-bottom:1px solid #eef1f4; }
+  input[type=number] { width:84px; padding:5px 6px; border:1px solid var(--line); border-radius:6px; font-size:13.5px; text-align:right; }
+  input[type=number]:focus { outline:2px solid #0b3d2e33; border-color:#0b3d2e; }
+  input.invalid { outline:2px solid #b4231855; border-color:var(--bad); }
+  .sumline { margin-top:10px; font-size:13px; color:var(--muted); }
+  .sumline b.bad { color:var(--bad); }
+  .btns { display:flex; gap:10px; flex-wrap:wrap; margin-top:4px; }
+  button { padding:9px 18px; border-radius:8px; border:1px solid #0b3d2e; background:#0b3d2e; color:#fff; font-size:14px; cursor:pointer; }
+  button.ghost { background:#fff; color:#0b3d2e; }
+  button:disabled { opacity:.55; cursor:default; }
+  #status { min-height: 26px; font-size:13.5px; margin: 10px 0 2px; color:var(--muted); }
+  #status .spin { display:inline-block; width:13px; height:13px; border:2px solid #0b3d2e33; border-top-color:#0b3d2e; border-radius:50%; animation:sp 0.8s linear infinite; vertical-align:-2px; margin-right:6px; }
+  @keyframes sp { to { transform: rotate(360deg); } }
+  .panel { border-radius:10px; padding:14px 16px; margin-top:10px; font-size:13.5px; display:none; }
+  .panel.ok { display:block; background:#eefaf1; border:1px solid #bfe6c9; }
+  .panel.infeasible { display:block; background:#fdf0ee; border:1px solid #f2c7c1; }
+  .panel.failure { display:block; background:#fdf6e4; border:1px solid #ecd9a0; }
+  .panel.invalid { display:block; background:#f1f3f5; border:1px solid var(--line); }
+  .panel h3 { margin:0 0 8px; font-size:14.5px; }
+  .panel.ok h3 { color:var(--ok); } .panel.infeasible h3 { color:var(--bad); }
+  .panel.failure h3 { color:var(--warn); } .panel.invalid h3 { color:var(--ink); }
+  .kv { margin:3px 0; }
+  .kv b { font-weight:600; }
+  .delta-pos { color:var(--ok); } .delta-neg { color:var(--bad); }
+  .locked-tag { color:var(--muted); font-size:12px; }
+  .note { font-size:12.5px; color:var(--muted); margin-top:8px; line-height:1.6; }
+  code { background:#eef1f4; padding:1px 5px; border-radius:4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>再生塑料配方试配筛选</h1>
+  <p id="metaLine">质检模型加载中…</p>
+</header>
+<main>
+  <section>
+    <h2>1. 原配方与各原料限制（总重须为 1000 克）</h2>
+    <table id="grid">
+      <thead>
+        <tr><th>原料</th><th>原配方（克）</th><th>下限（克）</th><th>上限（克）</th><th>锁定用量</th></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+    <div class="sumline" id="sumLine"></div>
+    <div class="btns">
+      <button id="solveBtn">开始求解</button>
+      <button class="ghost" id="feasibleBtn">载入可行样例</button>
+      <button class="ghost" id="infeasibleBtn">载入无解样例</button>
+    </div>
+    <div class="note">目标：合格概率 ≥ 0.7；先最少改变原料种数，再最小化总克数改变量；锁定的原料用量不变。计算期间可继续修改配方或限制——任何修改会立即撤下旧建议，迟到的旧结果不会恢复。</div>
+  </section>
+
+  <section>
+    <h2>2. 求解结果</h2>
+    <div id="status">尚未求解。</div>
+    <div class="panel ok" id="panelOk">
+      <h3>建议配方（已用原分类器复算）</h3>
+      <div class="kv">合格概率：<b id="okProb"></b>（阈值 0.7）</div>
+      <div class="kv">改动原料种数：<b id="okKinds"></b>　总克数改变量：<b id="okDelta"></b> 克　求解耗时：<span id="okMs"></span> ms</div>
+      <table style="margin-top:8px">
+        <thead><tr><th>原料</th><th>原用量</th><th>建议用量</th><th>变化</th></tr></thead>
+        <tbody id="okRows"></tbody>
+      </table>
+      <div class="kv" style="margin-top:8px">最优性结论：<b id="okOpt"></b></div>
+    </div>
+    <div class="panel infeasible" id="panelInfeasible">
+      <h3>已证明无解</h3>
+      <div class="kv" id="infeasibleReason"></div>
+      <div class="kv">求解耗时：<span id="infeasibleMs"></span> ms</div>
+    </div>
+    <div class="panel failure" id="panelFailure">
+      <h3>求解失败（非无解）</h3>
+      <div class="kv" id="failureReason"></div>
+    </div>
+    <div class="panel invalid" id="panelInvalid">
+      <h3>输入不合法</h3>
+      <div class="kv" id="invalidReason"></div>
+    </div>
+  </section>
+</main>
+
+<script>
+const TOTAL = 1000;
+let featureNames = ["原料1","原料2","原料3","原料4"];
+let samples = null;
+
+// ---- 结果撤回机制：epoch + AbortController ----
+// 任何输入修改都会令 epoch 递增、中止在途请求并立即清空旧建议；
+// 迟到的响应若 epoch 已过期则直接丢弃，绝不恢复旧建议。
+let epoch = 0;
+let inflight = null;
+
+const $ = id => document.getElementById(id);
+
+function buildGrid() {
+  const tbody = document.querySelector("#grid tbody");
+  tbody.innerHTML = "";
+  for (let i = 0; i < 4; i++) {
+    const tr = document.createElement("tr");
+    tr.innerHTML =
+      `<td>${featureNames[i]}</td>` +
+      `<td><input type="number" id="orig${i}" min="0" max="${TOTAL}" step="1"></td>` +
+      `<td><input type="number" id="lo${i}" min="0" max="${TOTAL}" step="1" value="0"></td>` +
+      `<td><input type="number" id="hi${i}" min="0" max="${TOTAL}" step="1" value="${TOTAL}"></td>` +
+      `<td><input type="checkbox" id="lock${i}"></td>`;
+    tbody.appendChild(tr);
+  }
+  if (!tbody.dataset.bound) {
+    tbody.dataset.bound = "1";
+    tbody.addEventListener("input", onUserEdit);
+    tbody.addEventListener("change", onUserEdit);
+  }
+}
+
+function onUserEdit() {
+  epoch++;                       // 使在途与未来的迟到结果全部失效
+  if (inflight) { inflight.abort(); inflight = null; }
+  $("solveBtn").disabled = false;
+  hidePanels();
+  $("status").textContent = "输入已修改，旧建议已撤下。请重新求解。";
+  updateSumLine();
+}
+
+function updateSumLine() {
+  let sum = 0, bad = false;
+  for (let i = 0; i < 4; i++) {
+    const el = $("orig" + i);
+    const v = el.value.trim() === "" ? NaN : Number(el.value);
+    if (!Number.isInteger(v) || v < 0 || v > TOTAL) { bad = true; el.classList.add("invalid"); }
+    else { el.classList.remove("invalid"); sum += v; }
+  }
+  $("sumLine").innerHTML = bad
+    ? "原配方存在非法数值。"
+    : (sum === TOTAL ? `原配方总重：<b>${sum}</b> 克 ✓` : `原配方总重：<b class="bad">${sum}</b> 克（须等于 ${TOTAL}）`);
+}
+
+function readForm() {
+  const num = id => { const s = $(id).value.trim(); const v = s === "" ? NaN : Number(s); return Number.isInteger(v) ? v : NaN; };
+  return {
+    original: [0,1,2,3].map(i => num("orig"+i)),
+    lower:    [0,1,2,3].map(i => num("lo"+i)),
+    upper:    [0,1,2,3].map(i => num("hi"+i)),
+    locked:   [0,1,2,3].map(i => $("lock"+i).checked),
+  };
+}
+
+function fillForm(s) {
+  for (let i = 0; i < 4; i++) {
+    $("orig"+i).value = s.original[i];
+    $("lo"+i).value = s.lower[i];
+    $("hi"+i).value = s.upper[i];
+    $("lock"+i).checked = s.locked[i];
+  }
+  onUserEdit();
+}
+
+function hidePanels() {
+  for (const id of ["panelOk","panelInfeasible","panelFailure","panelInvalid"])
+    $(id).style.display = "none";
+}
+function showPanel(id) { hidePanels(); $(id).style.display = "block"; }
+
+async function solve() {
+  const my = ++epoch;
+  if (inflight) inflight.abort();
+  inflight = new AbortController();
+  const signal = inflight.signal;
+  hidePanels();
+  $("status").innerHTML = '<span class="spin"></span>求解中…（期间可继续修改，修改将作废旧结果）';
+  $("solveBtn").disabled = true;
+  let data;
+  try {
+    const resp = await fetch("/api/solve", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(readForm()),
+      signal,
+    });
+    data = await resp.json();
+  } catch (e) {
+    if (my !== epoch) return;              // 已被更新的请求取代
+    $("solveBtn").disabled = false;
+    if (e.name === "AbortError") return;   // 用户修改触发的中止，onUserEdit 已处理
+    $("status").textContent = "请求失败：" + e.message;
+    return;
+  }
+  $("solveBtn").disabled = false;
+  if (my !== epoch) return;                // 迟到结果：丢弃，不恢复
+  renderResult(data);
+}
+
+function renderResult(d) {
+  if (d.status === "ok") {
+    $("okProb").textContent = (d.probability * 100).toFixed(2) + "%";
+    $("okKinds").textContent = d.changed_count;
+    $("okDelta").textContent = d.total_change;
+    $("okMs").textContent = d.solve_ms;
+    $("okOpt").textContent = d.optimality;
+    const rows = d.per_ingredient.map(p => {
+      const delta = p.delta === 0 ? "—" :
+        `<span class="${p.delta > 0 ? "delta-pos" : "delta-neg"}">${p.delta > 0 ? "+" : ""}${p.delta}</span>`;
+      const tag = p.locked ? ' <span class="locked-tag">(锁定)</span>' : "";
+      return `<tr><td>${p.name}${tag}</td><td>${p.original}</td><td><b>${p.new}</b></td><td>${delta}</td></tr>`;
+    }).join("");
+    $("okRows").innerHTML = rows;
+    showPanel("panelOk");
+    $("status").textContent = "求解完成，以下为经原分类器复核的建议。";
+  } else if (d.status === "infeasible") {
+    $("infeasibleReason").textContent = d.reason;
+    $("infeasibleMs").textContent = d.solve_ms;
+    showPanel("panelInfeasible");
+    $("status").textContent = "求解完成。";
+  } else if (d.status === "invalid") {
+    $("invalidReason").textContent = d.reason;
+    showPanel("panelInvalid");
+    $("status").textContent = "请修正输入后重试。";
+  } else {
+    $("failureReason").textContent = d.reason || "未知求解错误";
+    showPanel("panelFailure");
+    $("status").textContent = "求解失败。";
+  }
+}
+
+async function boot() {
+  buildGrid();
+  const [meta, smp] = await Promise.all([
+    fetch("/api/meta").then(r => r.json()),
+    fetch("/api/samples").then(r => r.json()),
+  ]);
+  samples = smp;
+  featureNames = meta.feature_names;
+  buildGrid();
+  $("metaLine").textContent =
+    `质检模型：随机森林 ${meta.n_trees} 棵树 / 深度 ≤ ${meta.max_depth}（实际深度 ${meta.tree_depths.join(",")}），` +
+    `固定种子 ${meta.train_seed} 训练；合格阈值 概率 ≥ ${meta.proba_threshold}；总重 ${meta.total_grams} 克。`;
+  fillForm(samples.feasible);
+  $("solveBtn").onclick = solve;
+  $("feasibleBtn").onclick = () => fillForm(samples.feasible);
+  $("infeasibleBtn").onclick = () => fillForm(samples.infeasible);
+}
+boot().catch(e => { $("status").textContent = "初始化失败：" + e.message; });
+</script>
+</body>
+</html>
