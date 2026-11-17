@@ -35,9 +35,18 @@
   .panel.infeasible { display:block; background:#fdf0ee; border:1px solid #f2c7c1; }
   .panel.failure { display:block; background:#fdf6e4; border:1px solid #ecd9a0; }
   .panel.invalid { display:block; background:#f1f3f5; border:1px solid var(--line); }
+  .panel.review { display:block; background:#fdf0ee; border:1px solid #f2c7c1; }
+  .panel.noshift { display:block; background:#eefaf1; border:1px solid #bfe6c9; }
   .panel h3 { margin:0 0 8px; font-size:14.5px; }
   .panel.ok h3 { color:var(--ok); } .panel.infeasible h3 { color:var(--bad); }
   .panel.failure h3 { color:var(--warn); } .panel.invalid h3 { color:var(--ink); }
+  .panel.review h3 { color:var(--bad); } .panel.noshift h3 { color:var(--ok); }
+  textarea { width:100%; min-height:180px; padding:9px 10px; border:1px solid var(--line); border-radius:8px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:13px; line-height:1.55; resize:vertical; }
+  textarea:focus { outline:2px solid #0b3d2e33; border-color:#0b3d2e; }
+  .errlist { margin:6px 0 0; padding-left:20px; color:var(--bad); max-height:170px; overflow:auto; }
+  .errlist li { margin:2px 0; }
+  .subtle { color:var(--muted); font-weight:400; font-size:12.5px; }
   .kv { margin:3px 0; }
   .kv b { font-weight:600; }
   .delta-pos { color:var(--ok); } .delta-neg { color:var(--bad); }
@@ -94,6 +103,45 @@
     <div class="panel invalid" id="panelInvalid">
       <h3>输入不合法</h3>
       <div class="kv" id="invalidReason"></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>3. 新增批次适用性核查 <span class="subtle">（叶节点占比差 · 999 次联合置换）</span></h2>
+    <div class="note" style="margin:0 0 10px">
+      粘贴 <b>20～200 行</b>四料整数克数记录，每行 4 个数、以空格或逗号分隔，每行总重须为 <b>1000 克</b>。
+      系统以固定种子另行生成的 <b id="refInfo">1000 条训练外参考配方</b>为基准，按模型 float32 输入语义
+      比较两组在五棵树各叶节点的占比，取所有叶节点占比差的最大绝对值为统计量；
+      对合并样本保持组大小联合置换 999 次估计整体 p 值。
+      <b>仅当 p ≤ 0.05 才提示人工复核</b>；否则只报“未检出偏移”，<b>不做放行判断</b>。
+      输入有误不出结论；编辑批次会立即撤下旧报告，迟到响应不会恢复。
+    </div>
+    <textarea id="batchText" placeholder="例如：&#10;250 250 350 150&#10;300,200,350,150&#10;……（20～200 行，每行总重 1000 克）"></textarea>
+    <div class="sumline" id="batchCount">尚未粘贴记录。</div>
+    <div class="btns">
+      <button id="driftBtn">开始核查</button>
+      <button class="ghost" id="driftExampleBtn">填入示例批次</button>
+      <button class="ghost" id="driftClearBtn">清空</button>
+    </div>
+    <div id="driftStatus">尚未核查。</div>
+    <div class="panel review" id="panelReview">
+      <h3>提示人工复核（p ≤ 0.05，检出分布偏移迹象）</h3>
+      <div class="kv">统计量 T（所有叶节点占比差的最大绝对值）：<b id="reviewStat"></b></div>
+      <div class="kv">整体 p 值：<b id="reviewP"></b>（999 次联合置换，阈值 0.05）</div>
+      <div class="kv" id="reviewWorst"></div>
+      <div class="kv" id="reviewSizes"></div>
+      <div class="note">该结论只提示“需要人工复核”，不构成合格或放行判断。</div>
+    </div>
+    <div class="panel noshift" id="panelNoShift">
+      <h3>未检出偏移</h3>
+      <div class="kv">统计量 T：<b id="noShiftStat"></b>　整体 p 值：<b id="noShiftP"></b>（&gt; 0.05）</div>
+      <div class="kv" id="noShiftWorst"></div>
+      <div class="kv" id="noShiftSizes"></div>
+      <div class="note">“未检出偏移”仅表示本次核查未达到人工复核阈值，<b>不构成放行判断</b>。</div>
+    </div>
+    <div class="panel invalid" id="panelDriftInvalid">
+      <h3>输入有误，未产生结论</h3>
+      <ul class="errlist" id="driftErrors"></ul>
     </div>
   </section>
 </main>
@@ -240,6 +288,105 @@ function renderResult(d) {
   }
 }
 
+// ---- 批次核查的独立撤回机制：与求解区互不影响 ----
+// 任何编辑都会令 driftEpoch 递增、中止在途核查并立即撤下旧报告；
+// 迟到响应经序号比对后丢弃，绝不恢复旧报告。
+let driftEpoch = 0;
+let driftInflight = null;
+
+const DRIFT_PANELS = ["panelReview", "panelNoShift", "panelDriftInvalid"];
+function hideDriftPanels() {
+  for (const id of DRIFT_PANELS) $(id).style.display = "none";
+}
+function showDriftPanel(id) { hideDriftPanels(); $(id).style.display = "block"; }
+
+function updateBatchCount() {
+  const lines = $("batchText").value.split("\n").map(s => s.trim()).filter(s => s !== "");
+  $("batchCount").textContent = lines.length === 0
+    ? "尚未粘贴记录。"
+    : `当前有效行数（非空行）：${lines.length} 行，允许范围 20～200 行；每行须 4 个整数且总重 1000 克。`;
+}
+
+function onBatchEdit() {
+  driftEpoch++;                          // 在途与迟到的旧结果全部失效
+  if (driftInflight) { driftInflight.abort(); driftInflight = null; }
+  $("driftBtn").disabled = false;
+  hideDriftPanels();
+  $("driftStatus").textContent = "批次内容已修改，旧报告已撤下。请重新核查。";
+  updateBatchCount();
+}
+
+function pct(x) { return (x * 100).toFixed(2) + "%"; }
+function worstText(w) {
+  return `差异最大：第 ${w.tree} 棵树的叶节点 #${w.leaf_id}——` +
+    `批次占比 ${pct(w.batch_proportion)}，参考组占比 ${pct(w.reference_proportion)}，` +
+    `占比差绝对值 ${pct(w.abs_diff)}。`;
+}
+function sizeText(d) {
+  return `样本量：批次 ${d.n_rows} 行；参考组 ${d.n_reference} 条训练外配方；置换 ${d.n_permutations} 次，耗时 ${d.elapsed_ms} ms。`;
+}
+
+function renderDriftResult(d) {
+  if (d.status === "review") {
+    $("reviewStat").textContent = d.statistic.toFixed(4);
+    $("reviewP").textContent = d.p_value.toFixed(3);
+    $("reviewWorst").textContent = worstText(d.worst_leaf);
+    $("reviewSizes").textContent = sizeText(d);
+    showDriftPanel("panelReview");
+    $("driftStatus").textContent = "核查完成：达到人工复核阈值。";
+  } else if (d.status === "no_shift") {
+    $("noShiftStat").textContent = d.statistic.toFixed(4);
+    $("noShiftP").textContent = d.p_value.toFixed(3);
+    $("noShiftWorst").textContent = worstText(d.worst_leaf);
+    $("noShiftSizes").textContent = sizeText(d);
+    showDriftPanel("panelNoShift");
+    $("driftStatus").textContent = "核查完成：未检出偏移（不做放行判断）。";
+  } else if (d.status === "invalid") {
+    $("driftErrors").innerHTML = d.errors.map(e => `<li>${e}</li>`).join("");
+    showDriftPanel("panelDriftInvalid");
+    $("driftStatus").textContent = "输入有误，未产生任何结论。请修正后重新核查。";
+  } else {
+    hideDriftPanels();
+    $("driftStatus").textContent = "核查失败：" + (d.detail || "未知错误");
+  }
+}
+
+async function runDrift() {
+  const my = ++driftEpoch;
+  if (driftInflight) driftInflight.abort();
+  driftInflight = new AbortController();
+  const signal = driftInflight.signal;
+  hideDriftPanels();
+  $("driftStatus").innerHTML = '<span class="spin"></span>核查中（999 次置换）…期间可继续编辑，编辑将作废本次结果';
+  $("driftBtn").disabled = true;
+  let data;
+  try {
+    const resp = await fetch("/api/drift", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: $("batchText").value }),
+      signal,
+    });
+    data = await resp.json();
+  } catch (e) {
+    if (my !== driftEpoch) return;
+    $("driftBtn").disabled = false;
+    if (e.name === "AbortError") return;   // 编辑触发的中止，onBatchEdit 已处理
+    $("driftStatus").textContent = "请求失败：" + e.message;
+    return;
+  }
+  $("driftBtn").disabled = false;
+  if (my !== driftEpoch) return;           // 迟到响应：丢弃，不恢复旧报告
+  renderDriftResult(data);
+}
+
+async function fillDriftExample() {
+  const r = await fetch("/api/drift/example");
+  const d = await r.json();
+  $("batchText").value = d.text;
+  onBatchEdit();
+}
+
 async function boot() {
   buildGrid();
   const [meta, smp] = await Promise.all([
@@ -252,10 +399,17 @@ async function boot() {
   $("metaLine").textContent =
     `质检模型：随机森林 ${meta.n_trees} 棵树 / 深度 ≤ ${meta.max_depth}（实际深度 ${meta.tree_depths.join(",")}），` +
     `固定种子 ${meta.train_seed} 训练；合格阈值 概率 ≥ ${meta.proba_threshold}；总重 ${meta.total_grams} 克。`;
+  $("refInfo").textContent =
+    `${meta.n_reference} 条训练外参考配方（参考种子 ${meta.reference_seed}）`;
   fillForm(samples.feasible);
   $("solveBtn").onclick = solve;
   $("feasibleBtn").onclick = () => fillForm(samples.feasible);
   $("infeasibleBtn").onclick = () => fillForm(samples.infeasible);
+  $("driftBtn").onclick = runDrift;
+  $("driftExampleBtn").onclick = fillDriftExample;
+  $("driftClearBtn").onclick = () => { $("batchText").value = ""; onBatchEdit(); };
+  $("batchText").addEventListener("input", onBatchEdit);
+  updateBatchCount();
 }
 boot().catch(e => { $("status").textContent = "初始化失败：" + e.message; });
 </script>

@@ -13,6 +13,9 @@
  6. 边界：原配方已合格（0 改动）、全锁定合格/不合格、各类非法输入；
  7. 求解失败路径：异常注入返回 solver_failure 而非无解；
  8. API：/、/api/meta、/api/samples、/api/solve 各状态分支；页面含迟到结果丢弃逻辑。
+ 9. 批次核查：参考集（1000 条训练外、整数克数、固定种子、float32 路由）、
+    文本解析七类非法输入、统计量手工核对、置换 p 值公式与确定性、同分布/强偏移
+    两分支、20/200 行边界、/api/drift 与 /api/drift/example 各分支。
 """
 from __future__ import annotations
 
@@ -248,6 +251,136 @@ def main():
     check("POST /api/solve 非法输入分支", r.json()["status"] == "invalid")
     html = client.get("/").text
     check("页面含迟到结果丢弃逻辑", "my !== epoch" in html and "abort" in html)
+
+    print("== 9. 新增批次适用性核查 ==")
+    from app import drift as drift_mod
+    from app.main import (
+        LEAF_IDS_BY_TREE,
+        NODE_COUNTS,
+        REF_GRAMS,
+        REF_LEAVES,
+    )
+
+    # 9.1 参考配方：1000 条、四料整数、总重 1000、取值合法、固定种子可复现
+    check("参考集 1000 条且全部总重 1000",
+          REF_GRAMS.shape == (1000, 4) and bool((REF_GRAMS.sum(axis=1) == TOTAL_GRAMS).all()))
+    check("参考集均为 [0,1000] 整数",
+          bool(((REF_GRAMS >= 0) & (REF_GRAMS <= TOTAL_GRAMS)).all())
+          and np.issubdtype(REF_GRAMS.dtype, np.integer))
+    ref_again = drift_mod.generate_reference_recipes()
+    check("参考集固定种子可复现", np.array_equal(ref_again, REF_GRAMS))
+    check("参考种子与训练种子不同（训练外）",
+          drift_mod.REFERENCE_SEED != 20241117)
+    check("参考集预路由为五棵树叶 id", REF_LEAVES.shape == (1000, 5))
+    # float32 语义：参考集路由与 clf.apply(float32(g/1000)) 完全一致
+    check("叶节点路由符合 float32 输入语义",
+          np.array_equal(drift_mod.route_leaves(clf, REF_GRAMS), REF_LEAVES))
+
+    # 9.2 文本解析：合法、各类非法、行数边界
+    good_text = drift_mod.example_batch_text(30)
+    parsed = drift_mod.parse_batch_text(good_text)
+    check("合法批次文本解析通过", parsed.rows is not None and len(parsed.rows) == 30
+          and all(sum(r) == TOTAL_GRAMS for r in parsed.rows))
+    bad_cases_drift = [
+        "",                                                    # 空
+        "1 2 3\n" + good_text,                                 # 行字段数错
+        "250.5 250 250 249.5\n" + good_text,                   # 小数
+        "250 250 250 249\n" + good_text,                       # 总重 999
+        "1001 -1 0 0\n" + good_text,                           # 越界/负数
+        "\n".join("250 250 250 250" for _ in range(19)),       # 行数不足
+        "\n".join("250 250 250 250" for _ in range(201)),      # 行数超限
+    ]
+    invalid_flags = []
+    for tc in bad_cases_drift:
+        p = drift_mod.parse_batch_text(tc)
+        invalid_flags.append(p.rows is None and len(p.errors) > 0)
+    check("七类非法输入均被拒绝且带行号错误", all(invalid_flags), f"{invalid_flags}")
+    comma_text = "250,250,250,250\n" + "\n".join("250 250 250 250" for _ in range(29))
+    p_comma = drift_mod.parse_batch_text(comma_text)
+    check("逗号分隔的合法文本可解析", p_comma.rows is not None and len(p_comma.rows) == 30)
+
+    # 9.3 统计量：手工核对一组占比差
+    rng_d = np.random.default_rng(321)
+    in_dist = drift_mod._integer_compose(
+        rng_d.dirichlet(drift_mod.DIRICHLET_ALPHA, size=40)
+    ).tolist()
+    res_ok = drift_mod.run_drift_check(clf, REF_LEAVES, LEAF_IDS_BY_TREE, NODE_COUNTS, in_dist)
+    # 手工重算统计量与最差叶节点
+    b_leaves = drift_mod.route_leaves(clf, np.asarray(in_dist))
+    manual_stat, manual_worst = drift_mod.max_leaf_diff(
+        REF_LEAVES, b_leaves, LEAF_IDS_BY_TREE, NODE_COUNTS
+    )
+    check("返回统计量与手工重算一致",
+          abs(res_ok["statistic"] - manual_stat) < 1e-15
+          and res_ok["worst_leaf"]["leaf_id"] == manual_worst["leaf_id"]
+          and res_ok["worst_leaf"]["tree"] == manual_worst["tree"])
+    # 占比口径核对：最差叶节点上的两组计数/组大小
+    w = manual_worst
+    t = w["tree_index"]
+    bp = float((b_leaves[:, t] == w["leaf_id"]).sum()) / len(in_dist)
+    rp = float((REF_LEAVES[:, t] == w["leaf_id"]).sum()) / 1000
+    check("最差叶节点两组占比口径正确",
+          abs(bp - w["batch_proportion"]) < 1e-15
+          and abs(rp - w["reference_proportion"]) < 1e-15
+          and abs(abs(bp - rp) - w["abs_diff"]) < 1e-15)
+
+    # 9.4 置换 p 值：999 次、公式 (1+exceed)/1000、范围 [1/1000,1]、确定性
+    check("p 值为含观测值的无偏估计",
+          res_ok["p_value"] == (1 + res_ok["permutation_exceed"]) / 1000
+          and 1 / 1000 - 1e-12 <= res_ok["p_value"] <= 1.0)
+    check("置换次数固定 999", res_ok["n_permutations"] == 999)
+    res_ok2 = drift_mod.run_drift_check(clf, REF_LEAVES, LEAF_IDS_BY_TREE, NODE_COUNTS, in_dist)
+    check("同输入重复核查结果完全一致",
+          res_ok["p_value"] == res_ok2["p_value"]
+          and res_ok["statistic"] == res_ok2["statistic"])
+
+    # 9.5 同分布批次通常不触发复核；强偏移批次必须 p<=0.05 并给人工复核
+    check("同分布批次未检出偏移（p>0.05）", res_ok["p_value"] > 0.05, f"p={res_ok['p_value']}")
+    rng_s = np.random.default_rng(555)
+    shifted = drift_mod._integer_compose(
+        rng_s.dirichlet([0.5, 0.5, 7.0, 0.6], size=40)
+    ).tolist()
+    res_shift = drift_mod.run_drift_check(
+        clf, REF_LEAVES, LEAF_IDS_BY_TREE, NODE_COUNTS, shifted
+    )
+    check("强偏移批次触发人工复核（p<=0.05）",
+          res_shift["p_value"] <= 0.05, f"p={res_shift['p_value']}")
+    check("偏移批次统计量显著大于同分布批次",
+          res_shift["statistic"] > res_ok["statistic"])
+
+    # 9.6 边界组大小：20 行与 200 行均可完成核查
+    rng_b = np.random.default_rng(77)
+    for n_b in (20, 200):
+        rows_b = drift_mod._integer_compose(
+            rng_b.dirichlet(drift_mod.DIRICHLET_ALPHA, size=n_b)
+        ).tolist()
+        rb = drift_mod.run_drift_check(clf, REF_LEAVES, LEAF_IDS_BY_TREE, NODE_COUNTS, rows_b)
+        check(f"{n_b} 行批次可完成核查", rb["n_rows"] == n_b and 0 < rb["p_value"] <= 1)
+
+    # 9.7 API：/api/meta 新参数、/api/drift 三分支、/api/drift/example、页面区块
+    mj2 = client.get("/api/meta").json()
+    check("meta 含漂移核查参数",
+          mj2["n_reference"] == 1000 and mj2["n_permutations"] == 999
+          and abs(mj2["drift_alpha"] - 0.05) < 1e-12 and "reference_seed" in mj2)
+    r = client.post("/api/drift", json={"text": good_text})
+    rj = r.json()
+    check("POST /api/drift 合法批次返回结论", r.status_code == 200
+          and rj["status"] in ("review", "no_shift")
+          and "worst_leaf" in rj and {"tree", "leaf_id", "batch_proportion",
+                                      "reference_proportion", "abs_diff"} <= set(rj["worst_leaf"]))
+    r = client.post("/api/drift", json={"text": bad_cases_drift[0]})
+    rj = r.json()
+    check("POST /api/drift 非法输入不出结论", r.status_code == 200
+          and rj["status"] == "invalid" and "p_value" not in rj and len(rj["errors"]) >= 1)
+    r = client.post("/api/drift", json={"text": "x"})
+    check("POST /api/drift 脏数据判 invalid", r.json()["status"] == "invalid")
+    r = client.get("/api/drift/example")
+    ex = r.json()
+    check("GET /api/drift/example 返回可解析合法批次",
+          drift_mod.parse_batch_text(ex["text"]).rows is not None)
+    check("页面含批次核查区块与独立撤回逻辑",
+          "runDrift" in html and "driftEpoch" in html and "onBatchEdit" in html
+          and "my !== driftEpoch" in html and "未检出偏移" in html and "人工复核" in html)
 
     print()
     if failures:

@@ -2,6 +2,7 @@
 //  1) 求解期间修改输入 → 旧建议立即撤下（结果区清空）
 //  2) 迟到的旧响应即使成功返回也绝不恢复显示
 //  3) 正常求解 → 结果正常渲染
+//  4) 新增批次核查：编辑即撤下、迟到不恢复、三种结论分支与输入错误渲染
 const fs = require('fs');
 const path = require('path');
 const html = fs.readFileSync(path.join(__dirname, '..', 'app', 'static', 'index.html'), 'utf8');
@@ -36,7 +37,9 @@ let fetchImpl = () => Promise.reject(new Error('fetch not stubbed'));
 global.fetch = (...a) => fetchImpl(...a);
 
 const META = { feature_names: ['A','B','C','D'], total_grams: 1000, proba_threshold: 0.7,
-  n_trees: 5, max_depth: 3, tree_depths: [3,3,3,3,3], train_seed: 1 };
+  n_trees: 5, max_depth: 3, tree_depths: [3,3,3,3,3], train_seed: 1,
+  n_reference: 1000, reference_seed: 2, n_permutations: 999, drift_alpha: 0.05,
+  drift_min_rows: 20, drift_max_rows: 200 };
 const SAMPLES = { feasible: { original: [250,250,350,150], lower: [0,0,0,0],
   upper: [1000,1000,1000,1000], locked: [false,true,false,false] },
   infeasible: { original: [150,130,620,100], lower: [0,0,620,0],
@@ -90,6 +93,63 @@ const driver = `
   await solve();
   assert('无解面板显示', document.getElementById('panelInfeasible').style.display === 'block');
   assert('ok 面板保持隐藏', document.getElementById('panelOk').style.display === 'none');
+
+  // ============ 新增批次适用性核查（独立 epoch，与求解区互不影响） ============
+  const REVIEW = { status: 'review', statistic: 0.4123, p_value: 0.001, n_rows: 40,
+    n_reference: 1000, n_permutations: 999, elapsed_ms: 190,
+    worst_leaf: { tree: 2, leaf_id: 14, batch_proportion: 0.35, reference_proportion: 0.12, abs_diff: 0.23 } };
+  const NO_SHIFT = { status: 'no_shift', statistic: 0.08, p_value: 0.62, n_rows: 30,
+    n_reference: 1000, n_permutations: 999, elapsed_ms: 180,
+    worst_leaf: { tree: 1, leaf_id: 7, batch_proportion: 0.2, reference_proportion: 0.18, abs_diff: 0.02 } };
+  const INVALID = { status: 'invalid', errors: ['第 1 行应有 4 个整数克数，实际 3 个。', '第 5 行总重为 999 克，须等于 1000 克。'] };
+
+  // 场景 5：偏移批次 → 人工复核面板，展示差异最大的树/叶节点与两组占比
+  fetchImpl = () => Promise.resolve({ json: async () => REVIEW });
+  await runDrift();
+  assert('偏移批次显示人工复核面板', document.getElementById('panelReview').style.display === 'block');
+  assert('复核面板含 p 值', document.getElementById('reviewP').textContent.includes('0.001'));
+  const worstHtml = document.getElementById('reviewWorst').textContent;
+  assert('展示差异最大树与叶节点', worstHtml.includes('第 2 棵树') && worstHtml.includes('叶节点 #14'));
+  assert('展示两组占比', worstHtml.includes('35.00%') && worstHtml.includes('12.00%'));
+  assert('求解区面板不受核查影响（保持无解）', document.getElementById('panelInfeasible').style.display === 'block');
+
+  // 场景 6：核查期间编辑 → 旧报告立即撤下；迟到响应不恢复
+  let resolveStaleDrift;
+  fetchImpl = () => new Promise(res => { resolveStaleDrift = () => res({ json: async () => REVIEW }); });
+  const dp = runDrift();
+  await sleep(5);
+  onBatchEdit();
+  assert('编辑后核查报告立即撤下', document.getElementById('panelReview').style.display === 'none');
+  assert('核查状态提示已撤下', document.getElementById('driftStatus').textContent.includes('撤下'));
+  resolveStaleDrift();
+  await dp;
+  await sleep(5);
+  assert('迟到核查响应未恢复面板', document.getElementById('panelReview').style.display === 'none');
+  assert('迟到核查响应未改写状态', document.getElementById('driftStatus').textContent.includes('撤下'));
+
+  // 场景 7：重新核查 → 未检出偏移分支（明确不做放行判断）
+  fetchImpl = () => Promise.resolve({ json: async () => NO_SHIFT });
+  await runDrift();
+  assert('未检出偏移面板显示', document.getElementById('panelNoShift').style.display === 'block');
+  assert('复核面板保持隐藏', document.getElementById('panelReview').style.display === 'none');
+  assert('偏移提示不含“放行”', !document.getElementById('panelNoShift').textContent.includes('准予放行'));
+
+  // 场景 8：输入有误 → 不出结论，错误列表面板
+  fetchImpl = () => Promise.resolve({ json: async () => INVALID });
+  await runDrift();
+  assert('输入错误面板显示', document.getElementById('panelDriftInvalid').style.display === 'block');
+  assert('错误信息逐行展示', document.getElementById('driftErrors').innerHTML.includes('第 5 行'));
+  assert('输入错误时结论面板均隐藏',
+    document.getElementById('panelReview').style.display === 'none' &&
+    document.getElementById('panelNoShift').style.display === 'none');
+
+  // 场景 9：示例按钮 → 拉取示例文本并触发撤下逻辑
+  fetchImpl = url => url.includes('example')
+    ? Promise.resolve({ json: async () => ({ text: '250 250 250 250' }) })
+    : Promise.resolve({ json: async () => NO_SHIFT });
+  await fillDriftExample();
+  assert('示例文本已填入', document.getElementById('batchText').value === '250 250 250 250');
+  assert('填入示例撤下旧报告', document.getElementById('panelNoShift').style.display === 'none');
 })();
 `;
 
